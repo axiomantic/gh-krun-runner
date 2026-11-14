@@ -1,0 +1,31 @@
+# Binaries
+daemon/gh-krun-daemon
+*.o
+*.a
+*.so
+*.dylib
+
+# Configuration with credentials
+daemon/config.toml
+config.toml
+*.env
+*.env.local
+
+# Virtual Machine disks & images
+images/
+*.raw
+*.img
+*.qcow2
+*.vmdk
+
+# Sockets and locks
+*.sock
+*.lock
+
+# Temporary and log files
+tmp/
+*.log
+.DS_Store
+
+# Go workspace
+daemon/vendor/

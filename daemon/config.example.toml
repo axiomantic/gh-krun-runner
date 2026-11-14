@@ -1,0 +1,51 @@
+# ==============================================================================
+# config.example.toml — Ephemeral Linux GPU Runner Orchestrator Configuration
+# ==============================================================================
+
+[github]
+# GitHub Token: leave as "auto" to automatically read your local `gh auth token`
+# Or provide a Personal Access Token with repo/actions/administration scope.
+token = "auto"
+
+# Target repositories to watch:
+# Supports explicit repos: "owner/repo"
+# Supports org/user wildcards: "axiomantic/*", "elijahr/*" (auto-discovers active repos)
+repos = [
+  "axiomantic/*",
+  "elijahr/*"
+]
+
+# Runner labels that this daemon fulfills
+# Workflows target these with `runs-on: [self-hosted, linux, arm64, gpu]`
+labels = ["self-hosted", "linux", "arm64", "gpu"]
+
+# Polling frequency in seconds
+poll_interval_sec = 5
+
+[vm]
+# Path to krunkit binary (Homebrew installs to /opt/homebrew/bin/krunkit)
+krunkit_path = "/opt/homebrew/bin/krunkit"
+
+# Path to gvproxy binary
+gvproxy_path = "/opt/homebrew/bin/gvproxy"
+
+# Path to the base EFI-bootable raw disk image built by scripts/build_rootfs.sh
+base_image_path = "/Users/Shared/gh-krun-runner/images/base_rootfs.raw"
+
+# Host path mounted strictly read-only at /models inside the guest
+# Leave empty ("") for 100% sealed sandbox with ZERO host filesystem access.
+models_dir = ""
+
+# Virtual Machine Resources allocated to each ephemeral job
+vcpus = 6
+memory_mib = 12288
+
+# Hard ceiling timeout in minutes for a single CI job execution
+timeout_minutes = 30
+
+# Ephemeral scratch directory for APFS CoW disk clones and sockets
+work_dir = "/tmp/gh-krun-runner"
+
+[lock]
+# Filesystem lock file path enforcing single-concurrency GPU isolation
+lock_file_path = "/tmp/gh-krun-gpu.lock"

@@ -1,0 +1,108 @@
+# ==============================================================================
+# guest/Containerfile — Ubuntu 24.04 ARM64 with Mesa Venus Vulkan & GitHub Runner
+# ==============================================================================
+FROM --platform=linux/arm64 ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# 1. Base OS Packages, Systemd, Networking, and Build Tools
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    udev \
+    iproute2 \
+    iptables \
+    isc-dhcp-client \
+    curl \
+    wget \
+    jq \
+    git \
+    sudo \
+    ca-certificates \
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    libssl-dev \
+    libicu-dev \
+    libffi-dev \
+    zlib1g-dev \
+    linux-image-generic \
+    # 2. Mesa Vulkan Drivers with Venus Support & Vulkan Tools
+    mesa-vulkan-drivers \
+    vulkan-tools \
+    libvulkan1 \
+    libvulkan-dev \
+    glslang-tools \
+    spirv-tools \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Create unprivileged 'runner' user with GPU/Render node access
+RUN useradd -m -s /bin/bash -u 1001 runner \
+    && groupadd -f render \
+    && groupadd -f video \
+    && usermod -aG sudo,video,render runner \
+    && echo "runner ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/runner \
+    && chmod 0440 /etc/sudoers.d/runner
+
+# 4. Install official GitHub Actions Runner (Linux ARM64)
+ARG RUNNER_VERSION=2.338.1
+RUN mkdir -p /home/runner/actions-runner && cd /home/runner/actions-runner \
+    && curl -sSL -o actions-runner.tar.gz \
+       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz" \
+    && tar xzf actions-runner.tar.gz \
+    && rm -f actions-runner.tar.gz \
+    && ./bin/installdependencies.sh \
+    && chown -R runner:runner /home/runner
+
+# 5. Compile llama.cpp with native Vulkan acceleration (-DGGML_VULKAN=1)
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp /opt/llama.cpp \
+    && cmake -B /opt/llama.cpp/build -S /opt/llama.cpp \
+       -DGGML_VULKAN=1 \
+       -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /opt/llama.cpp/build --config Release -j$(nproc) --target llama-cli llama-server \
+    && cp /opt/llama.cpp/build/bin/llama-cli /usr/local/bin/ \
+    && cp /opt/llama.cpp/build/bin/llama-server /usr/local/bin/ \
+    && rm -rf /opt/llama.cpp
+
+# 6. Install Python ML Libraries (ONNX Runtime, NumPy)
+RUN pip3 install --break-system-packages --no-cache-dir onnxruntime numpy
+
+# 7. Configure Virtio-GPU Venus ICD and permissions
+RUN mkdir -p /etc/vulkan/icd.d /usr/share/vulkan/icd.d
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json
+ENV VN_PERF=direct_resource
+ENV MESA_VK_DEVICE_SELECT=10005:0000
+
+# 8. Install Systemd Auto-Run Service for entrypoint.sh
+COPY guest/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Create a systemd unit to trigger /entrypoint.sh on boot
+RUN cat << 'EOF' > /etc/systemd/system/runner-entrypoint.service
+[Unit]
+Description=GitHub Actions Ephemeral Runner Entrypoint
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/entrypoint.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+RUN systemctl enable runner-entrypoint.service
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD [""]
