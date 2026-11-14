@@ -7,7 +7,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +20,9 @@ type GitHubClient struct {
 	httpClient      *http.Client
 	discoveredRepos []string
 	lastDiscovery   time.Time
+	mu              sync.Mutex
+	rateLimitRemaining int
+	rateLimitReset     time.Time
 }
 
 type UserRepoItem struct {
@@ -74,9 +79,10 @@ type GenerateJITConfigResponse struct {
 
 func NewGitHubClient(token string, repos []string, labels []string) *GitHubClient {
 	return &GitHubClient{
-		token:    token,
-		patterns: repos,
-		labels:   labels,
+		token:               token,
+		patterns:            repos,
+		labels:              labels,
+		rateLimitRemaining: -1, // Uninitialized
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -94,9 +100,53 @@ func (gh *GitHubClient) newRequest(method, url string, body io.Reader) (*http.Re
 	return req, nil
 }
 
+func (gh *GitHubClient) updateRateLimit(resp *http.Response) {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+
+	remStr := resp.Header.Get("X-RateLimit-Remaining")
+	resStr := resp.Header.Get("X-RateLimit-Reset")
+
+	if remStr != "" {
+		if rem, err := strconv.Atoi(remStr); err == nil {
+			gh.rateLimitRemaining = rem
+		}
+	}
+	if resStr != "" {
+		if epoch, err := strconv.ParseInt(resStr, 10, 64); err == nil {
+			gh.rateLimitReset = time.Unix(epoch, 0)
+		}
+	}
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		if gh.rateLimitRemaining == 0 || strings.Contains(strings.ToLower(resp.Status), "rate limit") {
+			log.Printf("[WARN] GitHub API rate limit reached. Resets at %v (in %v)",
+				gh.rateLimitReset.UTC(), time.Until(gh.rateLimitReset).Round(time.Second))
+		}
+	}
+}
+
+func (gh *GitHubClient) waitIfRateLimited() {
+	gh.mu.Lock()
+	rem := gh.rateLimitRemaining
+	reset := gh.rateLimitReset
+	gh.mu.Unlock()
+
+	if rem == 0 && time.Now().Before(reset) {
+		sleepDuration := time.Until(reset) + 2*time.Second
+		log.Printf("[WARN] Rate limit remaining is 0. Sleeping for %v until reset...", sleepDuration.Round(time.Second))
+		time.Sleep(sleepDuration)
+		gh.mu.Lock()
+		gh.rateLimitRemaining = -1 // Reset after waiting
+		gh.mu.Unlock()
+	}
+}
+
 // DiscoverActiveRepos refreshes the active candidate repositories based on configured patterns.
 func (gh *GitHubClient) DiscoverActiveRepos() ([]string, error) {
-	if time.Since(gh.lastDiscovery) < 2*time.Minute && len(gh.discoveredRepos) > 0 {
+	gh.waitIfRateLimited()
+
+	if time.Since(gh.lastDiscovery) < 5*time.Minute && len(gh.discoveredRepos) > 0 {
 		return gh.discoveredRepos, nil
 	}
 
@@ -116,12 +166,13 @@ func (gh *GitHubClient) DiscoverActiveRepos() ([]string, error) {
 	}
 
 	if hasWildcard {
-		// Fetch 50 most recently pushed repositories accessible by this token
-		url := "https://api.github.com/user/repos?sort=pushed&direction=desc&per_page=50"
+		// Fetch 30 most recently pushed repositories accessible by this token
+		url := "https://api.github.com/user/repos?sort=pushed&direction=desc&per_page=30"
 		req, err := gh.newRequest("GET", url, nil)
 		if err == nil {
 			resp, err := gh.httpClient.Do(req)
 			if err == nil {
+				gh.updateRateLimit(resp)
 				defer resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
 					var items []UserRepoItem
@@ -145,9 +196,15 @@ func (gh *GitHubClient) DiscoverActiveRepos() ([]string, error) {
 		results = append(results, r)
 	}
 
-	gh.discoveredRepos = results
 	gh.lastDiscovery = time.Now()
-	log.Printf("[INFO] Discovered %d active repositories matching criteria: %v", len(results), results)
+	if len(results) > 0 {
+		gh.discoveredRepos = results
+		log.Printf("[INFO] Discovered %d active repositories matching criteria: %v", len(results), results)
+	} else if len(gh.discoveredRepos) > 0 {
+		// Retain previously discovered repos if current probe returned empty due to rate limits or transient errors
+		results = gh.discoveredRepos
+	}
+
 	return results, nil
 }
 
@@ -169,78 +226,85 @@ func (gh *GitHubClient) matchesPattern(fullName string) bool {
 
 // FindMatchingQueuedJob scans active repositories for queued workflow jobs requiring runner labels.
 func (gh *GitHubClient) FindMatchingQueuedJob() (*QueuedJobMatch, error) {
+	gh.waitIfRateLimited()
+
 	repos, err := gh.DiscoverActiveRepos()
 	if err != nil {
 		return nil, err
 	}
 
-	statuses := []string{"queued", "in_progress"}
-
 	for _, fullName := range repos {
+		gh.waitIfRateLimited()
+
 		parts := strings.Split(fullName, "/")
 		if len(parts) != 2 {
 			continue
 		}
 		owner, repo := parts[0], parts[1]
 
-		for _, status := range statuses {
-			url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs?status=%s&per_page=5",
-				owner, repo, status)
+		// Query queued workflow runs only
+		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs?status=queued&per_page=5", owner, repo)
 
-			req, err := gh.newRequest("GET", url, nil)
-			if err != nil {
-				continue
-			}
+		req, err := gh.newRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
 
-			resp, err := gh.httpClient.Do(req)
-			if err != nil {
-				continue
-			}
+		resp, err := gh.httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		gh.updateRateLimit(resp)
 
-			if resp.StatusCode != http.StatusOK {
-				resp.Body.Close()
-				continue
-			}
-
-			var runsResp WorkflowRunsResponse
-			err = json.NewDecoder(resp.Body).Decode(&runsResp)
+		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			if err != nil || runsResp.TotalCount == 0 {
+			continue
+		}
+
+		var runsResp WorkflowRunsResponse
+		err = json.NewDecoder(resp.Body).Decode(&runsResp)
+		resp.Body.Close()
+		if err != nil || runsResp.TotalCount == 0 {
+			time.Sleep(100 * time.Millisecond) // Friendly delay between repository queries
+			continue
+		}
+
+		for _, run := range runsResp.WorkflowRuns {
+			gh.waitIfRateLimited()
+
+			jobsURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d/jobs?filter=queued",
+				owner, repo, run.ID)
+
+			jReq, err := gh.newRequest("GET", jobsURL, nil)
+			if err != nil {
 				continue
 			}
 
-			for _, run := range runsResp.WorkflowRuns {
-				jobsURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%d/jobs?filter=queued",
-					owner, repo, run.ID)
+			jResp, err := gh.httpClient.Do(jReq)
+			if err != nil {
+				continue
+			}
+			gh.updateRateLimit(jResp)
 
-				jReq, err := gh.newRequest("GET", jobsURL, nil)
-				if err != nil {
-					continue
-				}
+			var jobsResp WorkflowJobsResponse
+			err = json.NewDecoder(jResp.Body).Decode(&jobsResp)
+			jResp.Body.Close()
+			if err != nil || len(jobsResp.Jobs) == 0 {
+				continue
+			}
 
-				jResp, err := gh.httpClient.Do(jReq)
-				if err != nil {
-					continue
-				}
-
-				var jobsResp WorkflowJobsResponse
-				err = json.NewDecoder(jResp.Body).Decode(&jobsResp)
-				jResp.Body.Close()
-				if err != nil || len(jobsResp.Jobs) == 0 {
-					continue
-				}
-
-				for _, job := range jobsResp.Jobs {
-					if job.Status == "queued" && gh.matchesLabels(job.Labels) {
-						return &QueuedJobMatch{
-							Job:   &job,
-							Owner: owner,
-							Repo:  repo,
-						}, nil
-					}
+			for _, job := range jobsResp.Jobs {
+				if job.Status == "queued" && gh.matchesLabels(job.Labels) {
+					return &QueuedJobMatch{
+						Job:   &job,
+						Owner: owner,
+						Repo:  repo,
+					}, nil
 				}
 			}
 		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	return nil, nil
@@ -267,6 +331,8 @@ func (gh *GitHubClient) matchesLabels(jobLabels []string) bool {
 
 // GenerateJITConfig creates a single-use JIT configuration for the targeted repository.
 func (gh *GitHubClient) GenerateJITConfig(owner, repo, runnerName string) (string, error) {
+	gh.waitIfRateLimited()
+
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runners/generate-jitconfig", owner, repo)
 
 	payload := GenerateJITConfigRequest{
@@ -291,6 +357,7 @@ func (gh *GitHubClient) GenerateJITConfig(owner, repo, runnerName string) (strin
 	if err != nil {
 		return "", err
 	}
+	gh.updateRateLimit(resp)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {

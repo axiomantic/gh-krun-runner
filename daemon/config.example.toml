@@ -19,8 +19,8 @@ repos = [
 # Workflows target these with `runs-on: [self-hosted, linux, arm64, gpu]`
 labels = ["self-hosted", "linux", "arm64", "gpu"]
 
-# Polling frequency in seconds
-poll_interval_sec = 5
+# Polling frequency in seconds (15s recommended to stay well within GitHub API limits)
+poll_interval_sec = 15
 
 [vm]
 # Path to krunkit binary (Homebrew installs to /opt/homebrew/bin/krunkit)
