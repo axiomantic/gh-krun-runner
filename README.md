@@ -1,6 +1,6 @@
 # GitHub Actions Ephemeral Linux GPU Runner on Apple Silicon (`krunkit` + Virtio-GPU Venus)
 
-Production-ready, ephemeral Linux GitHub Actions self-hosted runner infrastructure running natively on **macOS Apple Silicon (M-series)** hosts. It delivers **Metal-backed Vulkan 1.3 GPU compute** to isolated Linux ARM64 microVMs using `krunkit`, `libkrun`, `virglrenderer`, `MoltenVK`, and `gvproxy`.
+Ephemeral Linux GitHub Actions self-hosted runner infrastructure running natively on **macOS Apple Silicon (M-series)** hosts. It delivers **Metal-backed Vulkan 1.3 GPU compute** to isolated Linux ARM64 microVMs using `krunkit`, `libkrun`, `virglrenderer`, `MoltenVK`, and `gvproxy`.
 
 ---
 
